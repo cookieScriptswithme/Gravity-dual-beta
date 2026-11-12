@@ -1,0 +1,512 @@
+--[[
+    Dual Gravity Coil
+    - Adjusted takeoff boost and vertical clamping for slower rise when jumping
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+
+local CONFIG_FILE = "dual_gravity_coil.json"
+local hasFS = (type(writefile) == "function")
+          and (type(readfile)  == "function")
+          and (type(isfile)    == "function")
+
+local chosenDual = nil
+local captureMode = false
+local uiEnabled = false
+local isActive = false
+local isMinimized = false
+
+-- Balanced rise
+local GRAVITY_STRENGTH = 1.05
+
+local attachment = nil
+local force = nil
+local connections = {}
+local equipSound = nil
+local wasOnGround = true
+
+local function saveConfig()
+    if not hasFS then return end
+    pcall(function()
+        writefile(CONFIG_FILE, HttpService:JSONEncode({
+            dualGear = chosenDual,
+            uiEnabled = uiEnabled
+        }))
+    end)
+end
+
+local function loadConfig()
+    if not hasFS then return end
+    pcall(function()
+        if isfile(CONFIG_FILE) then
+            local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
+            if type(data) == "table" then
+                if type(data.dualGear) == "string" and data.dualGear ~= "" then
+                    chosenDual = data.dualGear
+                end
+                if type(data.uiEnabled) == "boolean" then
+                    uiEnabled = data.uiEnabled
+                end
+            end
+        end
+    end)
+end
+
+loadConfig()
+
+local function clearConnections()
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(connections)
+end
+
+local function destroyForce()
+    if force then
+        pcall(function()
+            force.Enabled = false
+            force:Destroy()
+        end)
+        force = nil
+    end
+    if attachment then
+        pcall(function() attachment:Destroy() end)
+        attachment = nil
+    end
+end
+
+local function getAssemblyMass(root)
+    local total = root:GetMass()
+    local seen = {[root] = true}
+    local function gather(part)
+        for _, connected in ipairs(part:GetConnectedParts()) do
+            if not seen[connected] then
+                seen[connected] = true
+                total += connected:GetMass()
+                gather(connected)
+            end
+        end
+    end
+    gather(root)
+    return total
+end
+
+local function playEquipSound()
+    if equipSound then
+        equipSound:Destroy()
+    end
+    equipSound = Instance.new("Sound")
+    equipSound.SoundId = "rbxassetid://16619553"
+    equipSound.Volume = 0.7
+    equipSound.Parent = Workspace
+    equipSound:Play()
+    equipSound.Ended:Once(function()
+        if equipSound then
+            equipSound:Destroy()
+            equipSound = nil
+        end
+    end)
+end
+
+local function setupForce(character)
+    destroyForce()
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    attachment = Instance.new("Attachment")
+    attachment.Parent = root
+
+    force = Instance.new("VectorForce")
+    force.Attachment0 = attachment
+    force.RelativeTo = Enum.ActuatorRelativeTo.World
+    force.Force = Vector3.zero
+    force.Enabled = false
+    force.Parent = root
+end
+
+local function startDual()
+    if isActive then return end
+    isActive = true
+    wasOnGround = true
+
+    local char = player.Character
+    if char then
+        setupForce(char)
+        playEquipSound()
+    end
+
+    connections[#connections+1] = RunService.Heartbeat:Connect(function()
+        if not isActive then return end
+
+        local char = player.Character
+        if not char then
+            destroyForce()
+            return
+        end
+
+        local root = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not root or not hum or hum.Health <= 0 then
+            if force then force.Enabled = false end
+            return
+        end
+
+        -- Apply lighter anti-gravity force to slow the rise
+        if force and attachment then
+            local mass = getAssemblyMass(root)
+            force.Force = Vector3.new(0, mass * Workspace.Gravity * GRAVITY_STRENGTH, 0)
+            force.Enabled = true
+        end
+
+        -- Reduced takeoff boost for a smoother, slower ascent
+        local onGround = hum.FloorMaterial ~= Enum.Material.Air
+        if wasOnGround and not onGround then
+            local v = root.AssemblyLinearVelocity
+            root.AssemblyLinearVelocity = Vector3.new(v.X, math.min(math.max(v.Y, 0), 12), v.Z)
+        end
+        wasOnGround = onGround
+    end)
+end
+
+local function stopDual()
+    if not isActive then return end
+    isActive = false
+    clearConnections()
+    destroyForce()
+end
+
+local function isDualEquipped()
+    if not chosenDual or not player.Character then return false end
+    for _, t in ipairs(player.Character:GetChildren()) do
+        if t:IsA("Tool") and t.Name == chosenDual then
+            return true
+        end
+    end
+    return false
+end
+
+local function refreshState()
+    if uiEnabled and isDualEquipped() then
+        startDual()
+    else
+        stopDual()
+    end
+end
+
+-- ========== UI ==========
+local mainFrame, miniCircle, statusLabel, toggleBtn, setGearBtn
+
+local function updateUI()
+    if not statusLabel then return end
+
+    if not chosenDual then
+        statusLabel.Text = "No dual gravity set"
+        statusLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+        setGearBtn.Text = "Set Dual Gravity"
+    else
+        if isDualEquipped() then
+            if isActive then
+                statusLabel.Text = chosenDual .. "  |  ACTIVE"
+                statusLabel.TextColor3 = Color3.fromRGB(70, 220, 110)
+            else
+                statusLabel.Text = chosenDual .. "  |  equipped"
+                statusLabel.TextColor3 = Color3.fromRGB(220, 180, 70)
+            end
+        else
+            statusLabel.Text = chosenDual .. "  |  not equipped"
+            statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        end
+        setGearBtn.Text = "Dual: " .. chosenDual
+    end
+
+    if uiEnabled then
+        toggleBtn.Text = "ON"
+        toggleBtn.BackgroundColor3 = isActive and Color3.fromRGB(40, 150, 65) or Color3.fromRGB(120, 80, 40)
+    else
+        toggleBtn.Text = "OFF"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    end
+
+    if miniCircle then
+        if isActive then
+            miniCircle.BackgroundColor3 = Color3.fromRGB(40, 150, 65)
+        elseif uiEnabled then
+            miniCircle.BackgroundColor3 = Color3.fromRGB(120, 80, 40)
+        else
+            miniCircle.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+        end
+    end
+end
+
+local function setMinimized(state)
+    isMinimized = state
+    if state then
+        mainFrame.Visible = false
+        miniCircle.Visible = true
+        miniCircle.Position = mainFrame.Position
+    else
+        miniCircle.Visible = false
+        mainFrame.Visible = true
+        mainFrame.Position = miniCircle.Position
+    end
+end
+
+local function createUI()
+    local old = player.PlayerGui:FindFirstChild("DualGravity_UI")
+    if old then old:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "DualGravity_UI"
+    sg.ResetOnSpawn = false
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.Parent = player:WaitForChild("PlayerGui")
+
+    mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.fromOffset(210, 118)
+    mainFrame.Position = UDim2.fromScale(0.5, 0.12)
+    mainFrame.AnchorPoint = Vector2.new(0.5, 0)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    mainFrame.BorderSizePixel = 0
+    mainFrame.Active = true
+    mainFrame.Parent = sg
+
+    Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 9)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(100, 160, 255)
+    stroke.Thickness = 1.3
+    stroke.Parent = mainFrame
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -28, 0, 24)
+    title.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+    title.BorderSizePixel = 0
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 12
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Text = "Dual Gravity"
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = mainFrame
+
+    local titlePad = Instance.new("UIPadding")
+    titlePad.PaddingLeft = UDim.new(0, 8)
+    titlePad.Parent = title
+
+    Instance.new("UICorner", title).CornerRadius = UDim.new(0, 9)
+
+    local titleFix = Instance.new("Frame")
+    titleFix.Size = UDim2.new(1, 0, 0, 10)
+    titleFix.Position = UDim2.new(0, 0, 1, -10)
+    titleFix.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+    titleFix.BorderSizePixel = 0
+    titleFix.Parent = title
+
+    local minBtn = Instance.new("TextButton")
+    minBtn.Size = UDim2.fromOffset(22, 20)
+    minBtn.Position = UDim2.new(1, -24, 0, 2)
+    minBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    minBtn.BorderSizePixel = 0
+    minBtn.Font = Enum.Font.GothamBold
+    minBtn.TextSize = 16
+    minBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    minBtn.Text = "−"
+    minBtn.AutoButtonColor = true
+    minBtn.Parent = mainFrame
+    Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 5)
+
+    minBtn.MouseButton1Click:Connect(function()
+        setMinimized(true)
+    end)
+
+    statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, -12, 0, 16)
+    statusLabel.Position = UDim2.fromOffset(6, 28)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.TextSize = 11
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.TextColor3 = Color3.fromRGB(160, 160, 160)
+    statusLabel.Text = "No dual gravity set"
+    statusLabel.Parent = mainFrame
+
+    setGearBtn = Instance.new("TextButton")
+    setGearBtn.Size = UDim2.new(1, -12, 0, 24)
+    setGearBtn.Position = UDim2.fromOffset(6, 48)
+    setGearBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    setGearBtn.BorderSizePixel = 0
+    setGearBtn.Font = Enum.Font.GothamMedium
+    setGearBtn.TextSize = 11
+    setGearBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    setGearBtn.Text = "Set Dual Gravity"
+    setGearBtn.AutoButtonColor = true
+    setGearBtn.Parent = mainFrame
+    Instance.new("UICorner", setGearBtn).CornerRadius = UDim.new(0, 6)
+
+    toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(1, -12, 0, 28)
+    toggleBtn.Position = UDim2.fromOffset(6, 78)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextSize = 13
+    toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleBtn.Text = "OFF"
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.Parent = mainFrame
+    Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 6)
+
+    setGearBtn.MouseButton1Click:Connect(function()
+        captureMode = true
+        setGearBtn.Text = "Equip dual gravity..."
+        setGearBtn.BackgroundColor3 = Color3.fromRGB(80, 120, 200)
+    end)
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        uiEnabled = not uiEnabled
+        saveConfig()
+        refreshState()
+        updateUI()
+    end)
+
+    -- MINI CIRCLE
+    miniCircle = Instance.new("TextButton")
+    miniCircle.Size = UDim2.fromOffset(36, 36)
+    miniCircle.Position = mainFrame.Position
+    miniCircle.AnchorPoint = Vector2.new(0.5, 0)
+    miniCircle.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+    miniCircle.BorderSizePixel = 0
+    miniCircle.Text = ""
+    miniCircle.AutoButtonColor = false
+    miniCircle.Visible = false
+    miniCircle.Parent = sg
+
+    Instance.new("UICorner", miniCircle).CornerRadius = UDim.new(1, 0)
+
+    local miniStroke = Instance.new("UIStroke")
+    miniStroke.Color = Color3.fromRGB(100, 160, 255)
+    miniStroke.Thickness = 1.5
+    miniStroke.Parent = miniCircle
+
+    local miniIcon = Instance.new("TextLabel")
+    miniIcon.Size = UDim2.fromScale(1, 1)
+    miniIcon.BackgroundTransparency = 1
+    miniIcon.Font = Enum.Font.GothamBold
+    miniIcon.TextSize = 14
+    miniIcon.TextColor3 = Color3.fromRGB(255, 255, 255)
+    miniIcon.Text = "G"
+    miniIcon.Parent = miniCircle
+
+    -- drag vs click for circle
+    local mDragging = false
+    local mDragStart, mStartPos
+    local hasDragged = false
+    local DRAG_THRESHOLD = 6
+
+    miniCircle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            mDragging = true
+            hasDragged = false
+            mDragStart = input.Position
+            mStartPos = miniCircle.Position
+        end
+    end)
+
+    miniCircle.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if mDragging then
+                mDragging = false
+                if not hasDragged then
+                    setMinimized(false)
+                end
+            end
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if mDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - mDragStart
+            if delta.Magnitude > DRAG_THRESHOLD then
+                hasDragged = true
+            end
+            miniCircle.Position = UDim2.new(mStartPos.X.Scale, mStartPos.X.Offset + delta.X, mStartPos.Y.Scale, mStartPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    -- drag main frame
+    local dragging, dragStart, startPos
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = mainFrame.Position
+        end
+    end)
+    title.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    updateUI()
+end
+
+createUI()
+
+local function onCharacterAdded(character)
+    character.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") and captureMode then
+            chosenDual = child.Name
+            captureMode = false
+            setGearBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+            saveConfig()
+            print("[Dual Gravity] Gear saved:", chosenDual)
+            refreshState()
+            updateUI()
+        end
+    end)
+
+    character.ChildRemoved:Connect(function(child)
+        if child:IsA("Tool") and child.Name == chosenDual then
+            refreshState()
+            updateUI()
+        end
+    end)
+
+    task.defer(function()
+        if isActive then
+            setupForce(character)
+        end
+        refreshState()
+        updateUI()
+    end)
+end
+
+if player.Character then
+    onCharacterAdded(player.Character)
+end
+player.CharacterAdded:Connect(function(char)
+    stopDual()
+    onCharacterAdded(char)
+end)
+
+RunService.Heartbeat:Connect(function()
+    local was = isActive
+    refreshState()
+    if was ~= isActive then
+        updateUI()
+    end
+end)
+
+print("[Dual Gravity] Loaded")
